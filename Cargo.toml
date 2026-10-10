@@ -1,0 +1,23 @@
+[package]
+name = "crates-io-index-restoration"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Preserve and reconnect the original crates.io Git index history"
+
+[[bin]]
+name = "crates-io-index-restoration"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.102"
+gix = { path = "../../GitoxideLabs/gitoxide.tix-improvements/gix", default-features = false, features = ["sha1", "revision", "blocking-http-transport-curl", "pack-cache-lru-dynamic", "anyhow"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3.23"
+
+[profile.release]
+debug = 1
+
