@@ -7,13 +7,17 @@ fn run() -> Result<bool> {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() != Some("sync") {
         bail!(
-            "usage: crates-io-index-restoration sync TARGET [--archive URL] [--live URL] [--root OID] [--verify] [--retries N] [--retry-delay-ms N]"
+            "usage: crates-io-index-restoration sync TARGET [--rewrite] [--archive URL] [--live URL] [--root OID] [--verify] [--retries N] [--retry-delay-ms N]"
         );
     }
     let mut options = Options::new(PathBuf::from(args.next().context("missing TARGET")?));
     while let Some(arg) = args.next() {
         if arg == "--verify" {
             options.verify = true;
+            continue;
+        }
+        if arg == "--rewrite" {
+            options.rewrite = true;
             continue;
         }
         let value = args

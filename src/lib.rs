@@ -11,12 +11,15 @@ use anyhow::{Context, Result, ensure};
 use gix::{ObjectId, bstr::ByteSlice, objs::Write as _, refs::transaction::PreviousValue};
 use serde::{Deserialize, Serialize};
 
+mod rewrite;
 mod source;
 mod verify;
 
 const SNAPSHOTS: &str = "refs/restoration/sources/snapshots/";
 const LIVE: &str = "refs/restoration/sources/live/";
 const RESTORED: &str = "refs/heads/restored";
+const REPLACEMENT_VIEW: &str = "refs/restoration/views/replacement";
+const PRE_REWRITE: &str = "refs/restoration/views/pre-rewrite";
 
 pub struct Options {
     pub target: PathBuf,
@@ -24,6 +27,7 @@ pub struct Options {
     pub live: String,
     pub root: ObjectId,
     pub verify: bool,
+    pub rewrite: bool,
     pub retries: u32,
     pub retry_delay: Duration,
 }
@@ -36,6 +40,7 @@ impl Options {
             live: "https://github.com/rust-lang/crates.io-index.git".into(),
             root: oid("a33de1c98898dc1baf541ee2c5162e7baea7c838").expect("constant"),
             verify: false,
+            rewrite: false,
             retries: 3,
             retry_delay: Duration::from_secs(5),
         }
@@ -85,6 +90,7 @@ pub struct Outcome {
     pub received_objects: u64,
     pub elapsed_seconds: f64,
     pub full_verification: Option<verify::Summary>,
+    pub rewritten: Option<rewrite::Summary>,
 }
 
 fn oid(value: &str) -> Result<ObjectId> {
@@ -247,7 +253,25 @@ pub fn sync(options: &Options) -> Result<Outcome> {
             && oid(&manifest.original_root)? == options.root,
         "manifest sources/root/version do not match this invocation"
     );
-    let published = ref_id(&repo, RESTORED)?;
+    let rewriting = options.rewrite || state_dir.join("rewrite.sqlite").exists();
+    if rewriting && ref_id(&repo, REPLACEMENT_VIEW)?.is_none() {
+        let previous = ref_id(&repo, RESTORED)?;
+        ensure!(
+            previous.is_none()
+                || manifest.completed_tip.as_deref().map(oid).transpose()? == previous,
+            "cannot convert an unrelated restored branch"
+        );
+        if let Some(previous) = previous {
+            pin(&repo, PRE_REWRITE, previous)?;
+            pin(&repo, REPLACEMENT_VIEW, previous)?;
+        }
+    }
+    let view_ref = if rewriting {
+        REPLACEMENT_VIEW
+    } else {
+        RESTORED
+    };
+    let published = ref_id(&repo, view_ref)?;
     let cache_matches = manifest.completed_tip.as_deref().map(oid).transpose()? == published;
     let mut full = options.verify || !cache_matches || published.is_none();
     // Source refs outlive tracking refs, reflogs, remote deletions, and interrupted fetches.
@@ -312,7 +336,7 @@ pub fn sync(options: &Options) -> Result<Outcome> {
         let sources = refs(&repo, "refs/restoration/sources/")?;
         let mut required = sources.clone();
         if let Some(published) = published {
-            required.insert(RESTORED.into(), published);
+            required.insert(view_ref.into(), published);
         }
         let already_covered = if !full {
             manifest
@@ -406,6 +430,7 @@ pub fn sync(options: &Options) -> Result<Outcome> {
                 received_objects: transfer.objects,
                 elapsed_seconds: started.elapsed().as_secs_f64(),
                 full_verification: None,
+                rewritten: None,
             });
         }
         let count = if cutoff.is_some() {
@@ -429,7 +454,25 @@ pub fn sync(options: &Options) -> Result<Outcome> {
             verify::incremental(&view, tip, cutoff, validation.count)?;
             None
         };
-        update(&repo, RESTORED, tip, published)?;
+        update(&repo, view_ref, tip, published)?;
+        manifest.completed_tip = Some(tip.to_string());
+        manifest.commits = count;
+        manifest.verified_tips = manifest.sources.values().cloned().collect();
+        manifest.pending = None;
+        save(&manifest_path, &manifest)?;
+        let rewritten = if rewriting {
+            Some(rewrite::build(
+                &repo,
+                &state_dir,
+                tip,
+                options.root,
+                &manifest.links,
+                count,
+                options.verify,
+            )?)
+        } else {
+            None
+        };
         let bootstrap = state_dir.join("bootstrap");
         if bootstrap.exists() {
             let old_head: gix::refs::Target = repo.find_reference("HEAD")?.target().into();
@@ -441,11 +484,6 @@ pub fn sync(options: &Options) -> Result<Outcome> {
             ))?;
             fs::remove_file(bootstrap)?;
         }
-        manifest.completed_tip = Some(tip.to_string());
-        manifest.commits = count;
-        manifest.verified_tips = manifest.sources.values().cloned().collect();
-        manifest.pending = None;
-        save(&manifest_path, &manifest)?;
         return Ok(Outcome {
             fetched_tip: tip.to_string(),
             completed_tip: manifest.completed_tip,
@@ -458,6 +496,7 @@ pub fn sync(options: &Options) -> Result<Outcome> {
             received_objects: transfer.objects,
             elapsed_seconds: started.elapsed().as_secs_f64(),
             full_verification: summary,
+            rewritten,
         });
     }
     unreachable!()
@@ -659,11 +698,16 @@ fn validate_chain(
             }
             ensure!(roots.insert(info.id), "cycle at squash root {}", info.id);
             let (predecessor, snapshot) = marker(commit.message_raw()?.as_ref())?;
-            ensure!(
-                !roots.contains(&predecessor) && !seen.contains(&predecessor),
-                "cycle/conflicting predecessor at {} -> {predecessor}",
-                info.id
-            );
+            if seen.contains(&predecessor) {
+                // A merge may have visited older history before reaching this squash root.
+                for previous in repo.rev_walk([predecessor]).use_commit_graph(false).all()? {
+                    ensure!(
+                        previous?.id != info.id,
+                        "cycle at {} -> {predecessor}",
+                        info.id
+                    );
+                }
+            }
             match link_for(repo, info.id, snapshots)? {
                 Some(link) => {
                     validation.links.insert(info.id.to_string(), link);

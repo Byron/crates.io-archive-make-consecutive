@@ -1257,3 +1257,399 @@ fn bootstrap_preserves_an_unrelated_existing_restored_branch() {
         "an unrelated branch must not become a verified checkpoint"
     );
 }
+
+fn rewrite_sync(f: &Fixture, expected: i32) -> serde_json::Value {
+    let output = f.command().arg("--rewrite").output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if expected == 1 {
+        return serde_json::Value::Null;
+    }
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn rewrite_mapping(f: &Fixture) -> std::collections::BTreeMap<String, String> {
+    let path = f.manifest().parent().unwrap().join("rewrite.sqlite");
+    let db = rusqlite::Connection::open(path).unwrap();
+    db.prepare("SELECT original,rewritten FROM commits")
+        .unwrap()
+        .query_map([], |row| {
+            let original: Vec<u8> = row.get(0)?;
+            let rewritten: Vec<u8> = row.get(1)?;
+            Ok((
+                gix::ObjectId::from_bytes_or_panic(&original).to_string(),
+                gix::ObjectId::from_bytes_or_panic(&rewritten).to_string(),
+            ))
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn assert_rewritten(f: &Fixture) {
+    let mapping = rewrite_mapping(f);
+    let actual = git_walk(&f.target, true);
+    assert_eq!(
+        actual,
+        f.history
+            .iter()
+            .map(|id| mapping[id].clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(actual, git_walk(&f.target, false));
+    assert_eq!(actual, gix_topological_walk(&f.target));
+    let mut repo = gix::discover(&f.target).unwrap();
+    repo.objects.ignore_replacements = true;
+    for original in &f.history {
+        let source = repo
+            .find_commit(gix::ObjectId::from_hex(original.as_bytes()).unwrap())
+            .unwrap();
+        let rewritten = repo
+            .find_commit(gix::ObjectId::from_hex(mapping[original].as_bytes()).unwrap())
+            .unwrap();
+        assert_eq!(source.tree_id().unwrap(), rewritten.tree_id().unwrap());
+        assert_eq!(
+            source.message_raw().unwrap(),
+            rewritten.message_raw().unwrap()
+        );
+        let parents: Vec<_> = source.parent_ids().map(|id| id.to_string()).collect();
+        let expected: Vec<_> = if parents.is_empty() && original != &f.root {
+            let message = source.message_raw().unwrap();
+            let text = std::str::from_utf8(message.as_ref()).unwrap();
+            let predecessor = &text.split("Previous HEAD was ").nth(1).unwrap()[..40];
+            vec![mapping[predecessor].clone()]
+        } else {
+            parents.iter().map(|p| mapping[p].clone()).collect()
+        };
+        assert_eq!(
+            rewritten
+                .parent_ids()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+}
+
+#[test]
+fn rewritten_history_is_incremental_and_clones_without_replacement_refs() {
+    let mut f = Fixture::new();
+    let first = rewrite_sync(&f, 0);
+    assert_eq!(first["rewritten"]["newly_written_commits"], 0);
+    f.squash(1, true, true);
+    f.squash(2, true, false);
+    let update = rewrite_sync(&f, 0);
+    assert_eq!(update["rewritten"]["newly_written_commits"], 4);
+    assert_rewritten(&f);
+    let mapping = rewrite_mapping(&f);
+    let signature_root = &f.history[3];
+    let original = git(
+        &f.target,
+        &["--no-replace-objects", "cat-file", "commit", signature_root],
+        None,
+    );
+    let rewritten = git(
+        &f.target,
+        &[
+            "--no-replace-objects",
+            "cat-file",
+            "commit",
+            &mapping[signature_root],
+        ],
+        None,
+    );
+    assert!(original.contains("gpgsig "));
+    assert!(!rewritten.contains("gpgsig "));
+    assert!(rewritten.contains("x-preserved exact  spacing"));
+    let db_path = f.manifest().parent().unwrap().join("rewrite.sqlite");
+    let before = fs::read(&db_path).unwrap();
+    let unchanged = rewrite_sync(&f, 0);
+    assert_eq!(unchanged["rewritten"]["newly_mapped_commits"], 0);
+    assert_eq!(unchanged["rewritten"]["pack_bytes"], 0);
+    assert_eq!(before, fs::read(&db_path).unwrap());
+    f.advance("incremental rewritten update");
+    let advanced = rewrite_sync(&f, 0);
+    assert_eq!(advanced["rewritten"]["newly_written_commits"], 1);
+    assert_rewritten(&f);
+    let copy = f.dir.path().join("ordinary-clone.git");
+    git(
+        f.dir.path(),
+        &[
+            "clone",
+            "--bare",
+            "--no-local",
+            "--single-branch",
+            "--branch",
+            "restored",
+            f.target.to_str().unwrap(),
+            copy.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(git(&copy, &["for-each-ref", "refs/replace"], None).is_empty());
+    assert_eq!(git_walk(&copy, true), git_walk(&f.target, true));
+    git(
+        &copy,
+        &["--no-replace-objects", "fsck", "--full", "--strict"],
+        None,
+    );
+    let full = f
+        .command()
+        .args(["--rewrite", "--verify"])
+        .output()
+        .unwrap();
+    assert!(
+        full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+}
+
+#[test]
+fn replacement_view_converts_to_real_parents_and_preserves_existing_checkout() {
+    let mut f = Fixture::new();
+    init(&f.target, false);
+    let file = f.target.join("local-file");
+    fs::write(&file, "untracked contents").unwrap();
+    f.squash(1, true, false);
+    f.sync(0);
+    let converted = rewrite_sync(&f, 0);
+    assert_eq!(converted["rewritten"]["commits"], f.history.len());
+    assert_eq!(
+        git(&f.target, &["symbolic-ref", "HEAD"], None),
+        "refs/heads/main"
+    );
+    assert_eq!(fs::read_to_string(file).unwrap(), "untracked contents");
+    assert_eq!(
+        git(
+            &f.target,
+            &["rev-parse", "refs/restoration/views/replacement"],
+            None
+        ),
+        f.tip
+    );
+    assert_rewritten(&f);
+    f.advance("automatic rewritten mode");
+    let output = f.sync(0);
+    let summary: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(summary["rewritten"]["newly_written_commits"], 1);
+    assert_rewritten(&f);
+}
+
+#[test]
+fn rewritten_missing_boundary_keeps_previous_branch_then_recovers() {
+    let mut f = Fixture::new();
+    f.squash(1, true, false);
+    rewrite_sync(&f, 0);
+    let before = git(&f.target, &["rev-parse", "restored"], None);
+    let (_, predecessor) = f.squash(2, false, false);
+    let pending = rewrite_sync(&f, 2);
+    assert!(pending["pending"].is_object());
+    assert_eq!(git(&f.target, &["rev-parse", "restored"], None), before);
+    f.archive("snapshot-fixture-2", &predecessor);
+    rewrite_sync(&f, 0);
+    assert_rewritten(&f);
+}
+
+#[test]
+fn converting_with_new_live_commits_and_recovering_ref_publication() {
+    let mut f = Fixture::new();
+    f.squash(1, true, false);
+    f.sync(0);
+    let old_original = f.tip.clone();
+    f.advance("new commits during conversion");
+    rewrite_sync(&f, 0);
+    assert_rewritten(&f);
+    let db_path = f.manifest().parent().unwrap().join("rewrite.sqlite");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    let published = git(&f.target, &["rev-parse", "restored"], None);
+    let old_mapping = rewrite_mapping(&f)[&old_original].clone();
+    db.execute(
+        "UPDATE metadata SET value=?1 WHERE key='completed_original'",
+        [&old_original],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE metadata SET value=?1 WHERE key='completed_rewritten'",
+        [&old_mapping],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE metadata SET value=?1 WHERE key='completed_count'",
+        [(f.history.len() - 1).to_string()],
+    )
+    .unwrap();
+    for (key, value) in [
+        ("pending_original", f.tip.clone()),
+        ("pending_rewritten", published),
+        ("pending_count", f.history.len().to_string()),
+    ] {
+        db.execute("INSERT INTO metadata VALUES (?1,?2)", [key, &value])
+            .unwrap();
+    }
+    drop(db);
+    rewrite_sync(&f, 0);
+    assert_rewritten(&f);
+    let db = rusqlite::Connection::open(db_path).unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM metadata WHERE key LIKE 'pending_%'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn rewritten_merges_preserve_all_parent_edges() {
+    let mut f = Fixture::new();
+    f.squash(1, true, false);
+    rewrite_sync(&f, 0);
+    let previous = f.tip.clone();
+    let tree = f.tree(&[("merge", "complete merge tree")]);
+    let left = f.commit(&tree, Some(&previous), "left\n", "");
+    let right = f.commit(&tree, Some(&f.history[f.history.len() - 2]), "right\n", "");
+    let bytes = format!(
+        "tree {tree}\nparent {left}\nparent {right}\nauthor A <a@example.invalid> 1700000000 +0000\ncommitter C <c@example.invalid> 1700000001 +0000\n\nmerged\n"
+    );
+    f.tip = git(
+        &f.live,
+        &["hash-object", "-w", "-t", "commit", "--stdin"],
+        Some(bytes.as_bytes()),
+    );
+    f.set_live_tip();
+    let new: Vec<_> = git(
+        &f.live,
+        &["rev-list", "--topo-order", &format!("{previous}..master")],
+        None,
+    )
+    .lines()
+    .map(str::to_owned)
+    .collect();
+    f.history.splice(..0, new);
+    rewrite_sync(&f, 0);
+    let raw_ids = git(
+        &f.target,
+        &[
+            "rev-list",
+            "--topo-order",
+            "refs/restoration/views/replacement",
+        ],
+        None,
+    );
+    f.history = raw_ids.lines().map(str::to_owned).collect();
+    assert_rewritten(&f);
+}
+
+#[test]
+fn rewritten_ref_tampering_is_rejected_without_overwriting_it() {
+    let mut f = Fixture::new();
+    f.squash(1, true, false);
+    rewrite_sync(&f, 0);
+    git(
+        &f.target,
+        &["update-ref", "refs/heads/restored", &f.root],
+        None,
+    );
+    rewrite_sync(&f, 1);
+    assert_eq!(git(&f.target, &["rev-parse", "restored"], None), f.root);
+}
+
+#[test]
+fn rewritten_durable_mapping_resumes_before_branch_publication_and_survives_gc() {
+    let mut f = Fixture::new();
+    f.squash(1, true, false);
+    rewrite_sync(&f, 0);
+    let old_tip = f.tip.clone();
+    let old_rewritten = git(&f.target, &["rev-parse", "restored"], None);
+    let old_count = f.history.len();
+    f.advance("mapped before interrupted publication");
+    rewrite_sync(&f, 0);
+    let db_path = f.manifest().parent().unwrap().join("rewrite.sqlite");
+    let db = rusqlite::Connection::open(&db_path).unwrap();
+    for (key, value) in [
+        ("completed_original", old_tip),
+        ("completed_rewritten", old_rewritten.clone()),
+        ("completed_count", old_count.to_string()),
+    ] {
+        db.execute("UPDATE metadata SET value=?1 WHERE key=?2", [&value, key])
+            .unwrap();
+    }
+    drop(db);
+    git(
+        &f.target,
+        &["update-ref", "refs/heads/restored", &old_rewritten],
+        None,
+    );
+    let resumed = rewrite_sync(&f, 0);
+    assert_eq!(resumed["rewritten"]["newly_written_commits"], 0);
+    assert_rewritten(&f);
+    git(
+        &f.target,
+        &["reflog", "expire", "--expire=now", "--all"],
+        None,
+    );
+    git(&f.target, &["gc", "--prune=now"], None);
+    assert_rewritten(&f);
+    git(
+        &f.target,
+        &[
+            "--no-replace-objects",
+            "commit-graph",
+            "write",
+            "--reachable",
+        ],
+        None,
+    );
+    assert_rewritten(&f);
+}
+
+#[test]
+#[ignore = "requires native tix; set TIX_TEST_BIN and run --ignored"]
+fn native_tix_browses_rewritten_branch_without_replacement_refs() {
+    let mut f = Fixture::new();
+    f.squash(1, true, false);
+    f.squash(2, true, false);
+    rewrite_sync(&f, 0);
+    let copy = f.dir.path().join("tix-copy.git");
+    git(
+        f.dir.path(),
+        &[
+            "clone",
+            "--bare",
+            "--no-local",
+            "--single-branch",
+            "--branch",
+            "restored",
+            f.target.to_str().unwrap(),
+            copy.to_str().unwrap(),
+        ],
+        None,
+    );
+    git(&copy, &["commit-graph", "write", "--reachable"], None);
+    let output = Command::new(std::env::var_os("TIX_TEST_BIN").unwrap())
+        .current_dir(&copy)
+        .args(["show", "--no-auto-hide", "-x", &f.root, "restored"])
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout).unwrap();
+    let mapping = rewrite_mapping(&f);
+    for original in &f.history {
+        assert!(
+            text.contains(&mapping[original][..7]),
+            "missing {original}: {text}"
+        );
+    }
+}

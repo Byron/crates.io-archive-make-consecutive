@@ -1,10 +1,47 @@
 # crates.io-index-restoration
 
-A small Rust/Gitoxide tool that preserves the original crates.io Git index and connects its squash boundaries using standard [Git replacement refs](https://git-scm.com/docs/git-replace). The executable is named `crates-io-index-restoration`, since Rust crate names cannot contain a dot.
+A small Rust/Gitoxide tool that preserves the original crates.io Git index and connects its squash boundaries. Use `sync --rewrite` to build a portable branch with real connected parents, or `sync` in a new target for the original-ID view using standard [Git replacement refs](https://git-scm.com/docs/git-replace). The executable is named `crates-io-index-restoration`, since Rust crate names cannot contain a dot.
 
-Every source commit, tree, blob, message, timestamp and object ID remains intact. At a verified squash root `S`, the tool writes a replacement commit with predecessor `P` and publishes `refs/replace/S`. The visible history includes the original ID `S` as an empty-change marker, then continues through `P`. One replacement per squash connects every descendant. `refs/heads/restored` points to the verified live tip.
+Every original source object remains intact. At a verified squash root `S`, replacement mode writes a replacement commit with predecessor `P` and publishes `refs/replace/S`. Its visible history includes original ID `S` as an empty-change marker, then continues through `P`. Rewritten mode copies the affected commits with real parents instead. `refs/heads/restored` points to the complete result selected for the target.
 
-This is a consecutive **view**. With replacements disabled, the original parentless squash roots remain disconnected. A portable branch containing ordinary connected parents would require rewriting every affected descendant and maintaining an original-to-rewritten mapping; this tool does not create that second history.
+The replacement mode is a consecutive **view**: disabling replacements exposes original disconnected roots. Rewritten mode gives `restored` ordinary connected parents, changes affected commit IDs, and needs no replacement refs in a clone. Trees and blobs retain their original IDs and contents in both modes.
+
+## Portable history and incremental packs
+
+Convert the supplied target, or bootstrap a new bare repository, with:
+
+```sh
+./target/release/crates-io-index-restoration sync \
+  /Users/byron/dev/github.com/rust-lang/crates.io-index-archive --rewrite
+```
+
+The first run copies commits in parent-before-child order. Original parent IDs are replaced by their mapped IDs; each verified squash root receives the mapped archived predecessor. Every merge parent and its order are preserved. Commits whose parents remain unchanged keep their original bytes and IDs. Changed commits retain the tree, author, committer, message and applicable extra headers byte for byte; invalidated `gpgsig`, `gpgsig-sha256` and `mergetag` headers are removed. Original signed objects remain retained under source refs.
+
+Rewritten commits are compressed into **commit-only packs** using Gitoxide. Trees and blobs are reused from existing packs. Bootstrap installs/checkpoints at most 100,000 mappings per batch; normal syncs install one pack for their newly rewritten interval and no pack when unchanged. The first original interval can be reused without duplicating any objects. SQLite stores the original-to-rewritten mapping in the target's common Git directory at `restoration/rewrite.sqlite`, with 32 MiB cache, WAL transactions and full synchronization. Building requires system SQLite development libraries; the selected `rusqlite 0.39.0` uses the system library, without bundled SQLite.
+
+Packs and indexes are hashed, verified, synchronized and installed before mapping transactions commit. Temporary `.keep` files protect unpublished commit packs from garbage collection. Publication intent is durable before the checked branch update; interrupted runs recover the last completed mapping and resume. The old branch is retained at `refs/restoration/views/pre-rewrite`; the verified original-ID replacement view is maintained at `refs/restoration/views/replacement`. `restored` changes only after every mapped commit and the complete connected chain are verified. Existing HEAD, branches and working files are preserved.
+
+Once `rewrite.sqlite` exists, ordinary `sync TARGET` continues rewriting incrementally. Normal fast-forwards map only new commits. Missed squashes import all missing intervals through the same verified predecessor links. New merges may trigger the existing full source-validation fallback, while the rewriter still creates only unmapped commits. `--verify` rechecks every mapping and the full connected traversal. Keep the source refs and SQLite database with the producer repository to resume updates; a browsing clone needs only the real branch and its reachable objects.
+
+Ordinary cloning now transfers the connected history:
+
+```sh
+git clone --bare --single-branch --branch restored \
+  /Users/byron/dev/github.com/rust-lang/crates.io-index-archive /srv/crates-index-copy.git
+git -C /srv/crates-index-copy.git --no-replace-objects log restored
+git -C /srv/crates-index-copy.git commit-graph write --reachable
+```
+
+This branch-only transfer is tested through the Git transport with `--no-local`, without replacement refs or producer checkpoints. Such a consumer can use ordinary Git/Gitoxide/Tix and raw commit-graph acceleration. A producer containing replacement refs may still bypass its raw graph when replacements are enabled; use a separate raw handle or disable replacements for browsing its real branch.
+
+When your fork is ready, publishing is an explicit operator step:
+
+```sh
+git -C /Users/byron/dev/github.com/rust-lang/crates.io-index-archive \
+  push YOUR_FORK_URL refs/heads/restored:refs/heads/restored
+```
+
+No source or replacement refs are required for consumers of this rewritten branch. The job never pushes. Inspect the fork's permissions and hosting limits before a large first push; no GitHub push has been attempted. Many daily packs can eventually be consolidated with ordinary Git maintenance; the tool does not repack the multi-gigabyte archive on each invocation.
 
 ## Build and consumer compatibility
 
@@ -28,7 +65,7 @@ cargo build --manifest-path /path/to/gitoxide/Cargo.toml --release \
   --features gitoxide/small,gix-tix/sha1
 ```
 
-The compatible binaries tested in this workspace are `/Users/byron/dev/github.com/GitoxideLabs/gitoxide/target/release/gix` and the adjacent `tix`. Ensure these builds are selected by your `PATH`. Do not set `core.useReplaceRefs=false` as a workaround: with the fix, that disables replacements consistently with Git. Commit-graph acceleration is disabled when effective replacements require it; [validation results](doc/validation.md) record measured costs.
+The compatible binaries tested in this workspace are `/Users/byron/dev/github.com/GitoxideLabs/gitoxide/target/release/gix` and the adjacent `tix`. Ensure these builds are selected by your `PATH` when using the replacement view. A branch-only clone of rewritten `restored` has no replacement dependency. Do not set `core.useReplaceRefs=false` as a workaround for the replacement view: with the fix, that disables replacements consistently with Git. Commit-graph acceleration is disabled when effective replacements require it; [validation results](doc/validation.md) record measured costs.
 
 ## Restore and update
 
@@ -59,14 +96,14 @@ The archive's `main` is a README, and temporary upload branches are unrelated. E
 The single command accepts:
 
 ```text
-crates-io-index-restoration sync TARGET [--verify]
+crates-io-index-restoration sync TARGET [--rewrite] [--verify]
     [--archive URL] [--live URL] [--root OID]
     [--retries N] [--retry-delay-ms N]
 ```
 
 The source/root overrides support local fixtures or explicitly selected equivalent sources. A checkpoint is bound to the sources and original root used to create it. Default retries are three, with bounded backoff starting from a five-second base delay. Exit status `0` means the concrete fetched live tip is complete; `2` means a retryable missing archived boundary; `1` means an integrity, transport or other operational failure.
 
-JSON output includes the fetched coverage tip, last completed tip, verified commit count, newly checked commits, replacement count, exact pending root/predecessor/snapshot, incoming pack bytes, stored pack bytes, received object count and elapsed time. Coverage is anchored to the tip actually fetched, even if upstream advances during the run. A missing archive retains fetched objects and the previous complete branch; a later invocation retries the gap. A changed recorded snapshot, malformed marker, wrong predecessor, conflicting replacement, unexpected root, missing object or tree mismatch fails validation.
+JSON output includes the fetched original coverage tip, completed source-validation tip, verified commit count, newly checked commits, replacement count, exact pending root/predecessor/snapshot, incoming pack bytes, stored pack bytes, received object count and elapsed time. In rewritten mode the `rewritten` summary separately reports the real branch tip, newly mapped/written commits, generated pack/index bytes and rewrite elapsed time. Coverage is anchored to the tip actually fetched, even if upstream advances during the run. A missing archive retains fetched objects and the previous complete branch; a later invocation retries the gap. A changed recorded snapshot, malformed marker, wrong predecessor, conflicting replacement, unexpected root, missing object or tree mismatch fails validation.
 
 ## Browse through ordinary consumers
 
@@ -81,11 +118,12 @@ tix show --no-auto-hide -x a33de1c98898dc1baf541ee2c5162e7baea7c838 restored
 
 The `tix` command crosses all stitches and includes the selected root as its boundary marker. It can print millions of rows: for daily browsing, replace `-x` with an old or recent commit close to the interval you want to inspect. Neither a display limit nor an implicit remote-HEAD boundary proves ancestry continuity. `gix log` starts from `HEAD`; `gix revision list ... restored` explicitly selects this branch without moving an existing checkout.
 
-Inspect original parent links and signed commit bytes independently:
+Inspect signed original commit bytes independently. In rewritten mode, select `refs/restoration/views/replacement` with replacements disabled to inspect the disconnected source ancestry; disabling replacements on real `restored` keeps its connected parents:
 
 ```sh
 git -C /srv/crates.io-index-restored.git --no-replace-objects log restored
 git -C /srv/crates.io-index-restored.git --no-replace-objects cat-file commit ORIGINAL_OID
+git -C /srv/crates.io-index-restored.git --no-replace-objects log refs/restoration/views/replacement
 gix -r /srv/crates.io-index-restored.git -c core.useReplaceRefs=false revision list --long-hashes restored
 ```
 
@@ -101,7 +139,9 @@ Persistent refs are authoritative:
 | `refs/restoration/sources/live/<oid>` | Durable copy of each fetched live tip |
 | `refs/restoration/tracking/{archive,live}/<name>` | Mutable fetch destination |
 | `refs/replace/<original-root-oid>` | Standard graft replacement commit |
-| `refs/heads/restored` | Latest complete consecutive view |
+| `refs/restoration/views/replacement` | Original-ID view after conversion |
+| `refs/restoration/views/pre-rewrite` | Original branch tip preserved at conversion |
+| `refs/heads/restored` | Latest complete selected history, with real parents in rewritten mode |
 
 The target's Git common directory contains `restoration/manifest.json` and `restoration/sync.lock`, outside tracked index files. The atomic manifest records source refs/OIDs, verified root/predecessor/tree links, replacement OIDs, completed coverage and pending gaps. An exclusive process lock prevents overlapping jobs. Verified links are additive and `restored` is updated last; interrupted publication is recovered from refs. The tool does not depend on reflogs, dangling objects, pruning behavior or fetching unadvertised object IDs.
 
@@ -124,6 +164,8 @@ git -C /srv/crates.io-index-restored.git rev-list --topo-order restored | shasum
 git -C /srv/crates.io-index-restored.git rev-list --count restored
 ```
 
+For rewritten `restored`, these native commands report rewritten commit IDs. The producer's mapping verification translates those IDs back to originals. Use `refs/restoration/views/replacement` to compare the original-ID view, or `--raw` to walk real parents independently of replacement configuration.
+
 The example supports `--raw`, `--no-commit-graph` and `--ids` for independent validation and timing. Verification streams decoded objects using 32 MiB object and 64 MiB pack-delta caches; graph walks and coverage sets still consume memory proportional to reachable commit IDs. The full archive needs persistent multi-gigabyte storage. Incoming pack bytes exclude protocol/TLS overhead, and disk usage includes packs, indexes and retained sources; use `du -sh TARGET`, `git -C TARGET count-objects -vH` and `/usr/bin/time` alongside the JSON report. Actual production coverage, elapsed time and measured disk/memory/download costs are recorded in [doc/validation.md](doc/validation.md), not inferred from GitHub metadata counts.
 
 ## Schedule and transfer
@@ -136,7 +178,7 @@ A daily cron example uses an absolute executable path and persistent target:
 
 The particular hour is arbitrary. Archive uploads can lag a squash, and successful recovery does not require running before it. Retain and inspect exit status `2` reports and let a later scheduled run retry; investigate status `1`. The lock makes accidental overlap fail safely.
 
-Ordinary cloning does **not** copy replacement refs, and copying only `restored` loses disconnected source segments. Explicitly transfer all three ref groups into an empty repository:
+For the original-ID replacement view, ordinary cloning does **not** copy replacement refs, and copying only that branch loses disconnected source segments. The following procedure applies to a target still in replacement mode. In rewritten mode, use ordinary cloning above to transfer `restored`; the preserved replacement view is a different ref. Explicitly transfer all three ref groups into an empty repository:
 
 ```sh
 git init --bare /srv/crates.io-index-copy.git
@@ -157,6 +199,8 @@ This procedure is tested after garbage collection with reflogs expired. A transf
 cargo test --locked
 TIX_TEST_BIN=/path/to/compatible/tix cargo test --locked --test sync native_tix -- --ignored
 ```
+
+Rewritten-mode fixtures additionally verify missed squashes and lag, preserved merge parents, exact trees/messages, signature removal, conversion with concurrent live advancement, ref-publication recovery, durable mapping reuse, ref-tampering rejection, GC, unchanged database bytes, and ordinary branch-only cloning. The optional native test browses the cloned rewritten history with replacements disabled and a commit-graph present.
 
 Small local fixtures cover bootstrap, fast-forward/no-change updates, multiple missed squashes, signed metadata, dirty existing checkouts, archive lag and a snapshot moving between discovery and fetch, malformed/conflicting/missing objects, interruption and overlapping jobs, ref-based recovery, GC, explicit transfer and independent Git/Gitoxide sequences/digests. They also cover default/disabled replacement behavior, reopened handles, raw commit-graphs, missing replacement repair and unauthorized replacements. The native `tix` test is explicitly ignored until a separately built compatible executable is supplied; CI does not silently count that consumer as verified.
 
