@@ -111,8 +111,10 @@ Bootstrap performs full original-object and source-union verification. Routine l
 
 ```sh
 ./target/release/crates-io-index-restoration sync /srv/crates.io-index-restored.git --verify
-git -C /srv/crates.io-index-restored.git --no-replace-objects fsck --full --strict
+git -C /srv/crates.io-index-restored.git --no-replace-objects fsck --full --strict --progress
 ```
+
+Full verification decompresses and hashes historical object contents; it can take much longer than a revision walk. Normal syncs reuse completed verification. Git's `--progress` keeps the independent scan visible even when its output is redirected.
 
 Complete verification requires the known 2014 root `a33de1c98898dc1baf541ee2c5162e7baea7c838`, matching live-tip trees and coverage of every imported source history. Its summary includes a count and SHA-256 digest of ordered original commit IDs. The [independent native Gitoxide QA example](examples/native_walk.rs) imports no restorer logic and can compare Git's native topological traversal:
 
@@ -143,7 +145,7 @@ git -C /srv/crates.io-index-copy.git fetch /srv/crates.io-index-restored.git \
   'refs/restoration/sources/*:refs/restoration/sources/*' \
   'refs/replace/*:refs/replace/*'
 git -C /srv/crates.io-index-copy.git symbolic-ref HEAD refs/heads/restored
-git -C /srv/crates.io-index-copy.git --no-replace-objects fsck --full --strict
+git -C /srv/crates.io-index-copy.git --no-replace-objects fsck --full --strict --progress
 git -C /srv/crates.io-index-copy.git log restored
 ```
 
