@@ -6,6 +6,8 @@ Every original source object remains intact. At a verified squash root `S`, repl
 
 The replacement mode is a consecutive **view**: disabling replacements exposes original disconnected roots. Rewritten mode gives `restored` ordinary connected parents, changes affected commit IDs, and needs no replacement refs in a clone. Trees and blobs retain their original IDs and contents in both modes.
 
+The supplied archive now contains a verified real branch. [Rewritten production validation](doc/rewritten-validation.md) records actual coverage, commit-pack sizes, mapping/storage costs and incremental timings; [the earlier report](doc/validation.md) records source-object and replacement-view validation.
+
 ## Portable history and incremental packs
 
 Convert the supplied target, or bootstrap a new bare repository, with:
